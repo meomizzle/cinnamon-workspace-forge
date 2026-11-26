@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# ws-forge — CLI manager for per-workspace wallpapers + desktop icons
+# on Cinnamon (X11). Hardened rewrite of dj1s's forum technique
+# (forums.linuxmint.com/viewtopic.php?t=360221).
+#
+# Commands: init, create, amend, delete, list, apply, undo, status,
+#           install-autostart
+set -u
+
+CONF_DIR="${WS_FORGE_CONF_DIR:-$HOME/.config/workspace-forge}"
+CONF="$CONF_DIR/workspaces.conf"
+JOURNAL="$CONF_DIR/journal"
+BACKUPS="$CONF_DIR/backups"
+STORE="${WS_FORGE_STORE:-$HOME/desk-forge}"
+
+usage() {
+    cat <<'EOF'
+Usage: ws-forge <command> [args]
+
+  init [-y]                  One-time bootstrap: relocate the real Desktop to
+                             ~/desk-forge/original and symlink it back.
+  create <N> --name NAME [--wallpaper PATH] [--options OPT] [--seed]
+                             Register workspace N (1-based) with its own
+                             wallpaper and icon folder. --seed copies the
+                             original Desktop contents into it as a starter.
+  amend  <N> [--name NAME] [--wallpaper PATH] [--options OPT]
+                             Change an existing workspace's settings.
+  delete <N> [--purge]       Remove workspace N from config. --purge also
+                             deletes its icon folder (never 'original').
+  list                       Show all configured workspaces.
+  apply  <N>                 Apply workspace N immediately.
+  undo                       Restore the previous workspaces.conf.
+  status                     Show current workspace, symlink target, journal.
+  install-autostart          Add the watcher daemon to Cinnamon autostart.
+
+Environment overrides: WS_FORGE_CONF_DIR, WS_FORGE_STORE
+EOF
+}
+
+die()  { echo "ws-forge: $*" >&2; exit 1; }
+info() { echo "[ws-forge] $*"; }
+log()  { echo "$(date +%Y-%m-%dT%H:%M:%S) $*" >> "$JOURNAL"; }
+
+ensure_dirs() {
+    mkdir -p "$CONF_DIR" "$BACKUPS" "$STORE"
+    [ -f "$CONF" ] || touch "$CONF"
+}
+
+backup_conf() {
+    ensure_dirs
+    [ -s "$CONF" ] || return 0
+    local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+    cp "$CONF" "$BACKUPS/workspaces.conf.$stamp"
+    # keep only the 10 most recent backups
+    ls -1t "$BACKUPS"/workspaces.conf.* 2>/dev/null | tail -n +11 | xargs -r rm -f
+}
+
+# upsert <N> <key> <value>  — single source of truth for config writes
+upsert() {
+    local n="$1" key="ws${1}_${2}=" val="$3"
+    if grep -q "^${key}" "$CONF" 2>/dev/null; then
+        grep -v "^${key}" "$CONF" > "$CONF.tmp" || true
+        mv "$CONF.tmp" "$CONF"
+    fi
+    printf '%s"%s"\n' "$key" "$val" >> "$CONF"
+}
+
+valid_ws() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] \
+        || die "workspace number must be a positive integer (got '${1:-}')"
+}
+
+wallpaper_exists() {
+    [ -n "${1:-}" ] || return 0
+    [ -f "$1" ] || die "wallpaper not found: $1"
+}
+
+cmd_init() {
+    local DESK; DESK=$(xdg-user-dir DESKTOP)
+    ensure_dirs
+    if [ -L "$DESK" ]; then
+        info "Desktop is already a symlink ($(readlink "$DESK")) - nothing to do."
+        return 0
+    fi
+    [ -d "$DESK" ] || die "Desktop directory '$DESK' does not exist"
+    if [ "${1:-}" != "-y" ]; then
+        echo "About to MOVE all contents of '$DESK' into '$STORE/original'"
+        echo "and replace it with a symlink. Continue? [y/N]"
+        read -r ANS
+        [[ "$ANS" =~ ^[Yy]$ ]] || die "aborted"
+    fi
+    mkdir -p "$STORE/original"
+    find "$DESK" -mindepth 1 -maxdepth 1 -exec mv -t "$STORE/original/" {} +
+    rmdir "$DESK" || die "could not remove '$DESK' - check for stray files"
+    ln -s "$STORE/original" "$DESK"
+    info "bootstrap complete: $DESK -> $STORE/original"
+    log "init DESK=$DESK STORE=$STORE"
+}
+
+cmd_create() {
+    local N="$1"; shift; valid_ws "$N"
+    local NAME="" WP="" OPT="" SEED=no
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)      NAME="$2"; shift 2 ;;
+            --wallpaper) wallpaper_exists "$2"; WP="$2"; shift 2 ;;
+            --options)   OPT="$2"; shift 2 ;;
+            --seed)      SEED=yes; shift ;;
+            *)           die "unknown option: $1" ;;
+        esac
+    done
+    ensure_dirs
+    local FOL="$STORE/ws-$N"
+    if [ -e "$FOL" ] && [ ! -d "$FOL" ]; then
+        die "$FOL exists and is not a directory"
+    fi
+    mkdir -p "$FOL"
+    if [ "$SEED" = "yes" ] && [ -d "$STORE/original" ]; then
+        cp -a "$STORE/original/." "$FOL/"
+        info "seeded $FOL from original"
+    fi
+    backup_conf
+    [ -n "$NAME" ] && upsert "$N" name "$NAME"
+    [ -n "$WP" ]   && upsert "$N" wallpaper "$WP"
+    [ -n "$OPT" ]  && upsert "$N" options "$OPT"
+    upsert "$N" folder "$FOL"
+    info "workspace $N registered${NAME:+ ($NAME)}"
+    log "create ws=$N name=$NAME wallpaper=$WP options=$OPT folder=$FOL"
+}
+
+cmd_amend() {
+    local N="$1"; shift; valid_ws "$N"
+    grep -q "^ws${N}_folder=" "$CONF" 2>/dev/null \
+        || die "workspace $N is not configured (create it first)"
+    local changed=no
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)      backup_conf; upsert "$N" name "$2"; changed=yes; shift 2 ;;
+            --wallpaper) wallpaper_exists "$2"; backup_conf; upsert "$N" wallpaper "$2"; changed=yes; shift 2 ;;
+            --options)   backup_conf; upsert "$N" options "$2"; changed=yes; shift 2 ;;
+            *)           die "unknown option: $1" ;;
+        esac
+    done
+    if [ "$changed" = yes ]; then
+        info "workspace $N amended"
+        log "amend ws=$N"
+    else
+        info "nothing to change"
+    fi
+}
+
+cmd_delete() {
+    local N="$1"; shift; valid_ws "$N"
+    local PURGE=no
+    [ "${1:-}" = "--purge" ] && PURGE=yes
+    grep -q "^ws${N}_" "$CONF" 2>/dev/null || die "workspace $N is not configured"
+    backup_conf
+    grep -v "^ws${N}_" "$CONF" > "$CONF.tmp"; mv "$CONF.tmp" "$CONF"
+    local FOL="$STORE/ws-$N"
+    if [ "$PURGE" = yes ] && [ -d "$FOL" ]; then
+        rm -rf "$FOL"
+        info "removed config and folder $FOL"
+    else
+        info "removed config (folder kept at $FOL)"
+    fi
+    rm -f "$CONF_DIR/last-applied"
+    log "delete ws=$N purge=$PURGE"
+}
+
+cmd_list() {
+    [ -s "$CONF" ] || { echo "No workspaces configured yet."; exit 0; }
+    printf '%-4s %-16s %-46s %s\n' "WS" "NAME" "WALLPAPER" "FOLDER"
+    for N in $(grep -o '^ws[0-9]*_' "$CONF" | grep -o '[0-9]*' | sort -nu); do
+        NAME=$(grep "^ws${N}_name=" "$CONF" | cut -d'"' -f2)
+        WP=$(grep   "^ws${N}_wallpaper=" "$CONF" | cut -d'"' -f2)
+        FOL=$(grep  "^ws${N}_folder=" "$CONF" | cut -d'"' -f2)
+        printf '%-4s %-16s %-46s %s\n' "$N" "${NAME:--}" "${WP:--}" "${FOL:--}"
+    done
+}
+
+cmd_apply() {
+    local SELF_DIR; SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+    [ -n "${1:-}" ] || die "need a workspace number: ws-forge apply <N>"
+    exec "$SELF_DIR/ws-apply" "$1"
+}
+
+cmd_undo() {
+    ensure_dirs
+    local latest
+    latest=$(ls -1t "$BACKUPS"/workspaces.conf.* 2>/dev/null | head -n1)
+    [ -n "$latest" ] || die "nothing to undo (no backups yet)"
+    cp "$latest" "$CONF"
+    rm -f "$CONF_DIR/last-applied"
+    info "restored config from $latest"
+    log "undo from $latest"
+}
+
+cmd_status() {
+    local DESK; DESK=$(xdg-user-dir DESKTOP)
+    echo "== ws-forge status =="
+    if command -v xprop >/dev/null 2>&1; then
+        CUR=$(xprop -root _NET_CURRENT_DESKTOP 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ')
+        echo "Current workspace : $((${CUR:-0} + 1))"
+    else
+        echo "Current workspace : unknown (xprop missing)"
+    fi
+    if [ -L "$DESK" ]; then
+        echo "Desktop symlink   : $DESK -> $(readlink "$DESK")"
+    else
+        echo "Desktop symlink   : none (real directory - run 'ws-forge init')"
+    fi
+    if [ -f "$CONF_DIR/last-applied" ]; then
+        echo "Last applied      : workspace $(cat "$CONF_DIR/last-applied")"
+    fi
+    if [ -f "$CONF_DIR/watchd.pid" ] && kill -0 "$(cat "$CONF_DIR/watchd.pid" 2>/dev/null)" 2>/dev/null; then
+        echo "Watcher           : running (pid $(cat "$CONF_DIR/watchd.pid"))"
+    else
+        echo "Watcher           : not running (start with: ws-watchd &)"
+    fi
+    echo "--- journal (last 5) ---"
+    tail -n 5 "$JOURNAL" 2>/dev/null || echo "(empty)"
+}
+
+cmd_install_autostart() {
+    local AUTODIR="$HOME/.config/autostart"
+    local SELF_DIR; SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+    mkdir -p "$AUTODIR"
+    cat > "$AUTODIR/ws-watchd.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Workspace Forge Watcher
+Exec=$SELF_DIR/ws-watchd
+Terminal=false
+X-GNOME-Autostart-enabled=true
+EOF
+    info "installed $AUTODIR/ws-watchd.desktop (runs on next login)"
+    log "install-autostart"
+}
+
+case "${1:-}" in
+    init)              shift; cmd_init "$@" ;;
+    create)            [ $# -ge 2 ] || die "usage: ws-forge create <N> [options]"; shift; cmd_create "$@" ;;
+    amend)             [ $# -ge 2 ] || die "usage: ws-forge amend <N> [options]"; shift; cmd_amend "$@" ;;
+    delete)            [ $# -ge 2 ] || die "usage: ws-forge delete <N> [--purge]"; shift; cmd_delete "$@" ;;
+    list)              cmd_list ;;
+    apply)             shift; cmd_apply "$@" ;;
+    undo)              cmd_undo ;;
+    status)            cmd_status ;;
+    install-autostart) cmd_install_autostart ;;
+    help|-h|--help)    usage ;;
+    *)                 usage; exit 1 ;;
+esac
