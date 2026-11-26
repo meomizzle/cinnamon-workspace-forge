@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# ws-apply — apply one workspace's wallpaper + desktop icons (Cinnamon, X11).
+# Called by `ws-forge apply N` and by the ws-watchd daemon.
+# Takes a 1-based workspace number. Silently no-ops for unmapped workspaces.
+set -u
+
+CONF_DIR="${WS_FORGE_CONF_DIR:-$HOME/.config/workspace-forge}"
+CONF="$CONF_DIR/workspaces.conf"
+STATE="$CONF_DIR/last-applied"
+
+N="${1:-}"
+if [ -z "$N" ] || ! [[ "$N" =~ ^[0-9]+$ ]]; then
+    echo "ws-apply: need a numeric workspace number (1-based)" >&2
+    exit 1
+fi
+[ -f "$CONF" ] || exit 0
+[ -s "$CONF" ] || exit 0
+
+# Skip if we already applied this workspace (watcher can fire redundantly)
+if [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$N" ]; then
+    exit 0
+fi
+
+# Read this workspace's stanza (ws<N>_name, ws<N>_wallpaper, ...)
+get_key() {
+    local key="ws${N}_${1}="
+    grep "^${key}" "$CONF" 2>/dev/null | head -n1 | cut -d'"' -f2
+}
+NAME=$(get_key name)
+WP=$(get_key wallpaper)
+OPT=$(get_key options)
+FOL=$(get_key folder)
+
+DESK=$(xdg-user-dir DESKTOP)
+
+# --- Wallpaper --------------------------------------------------------------
+if [ -n "$WP" ] && [ -f "$WP" ]; then
+    gsettings set org.cinnamon.desktop.background picture-uri "file://${WP}"
+    gsettings set org.cinnamon.desktop.background picture-uri-dark "file://${WP}"
+    if [ -n "$OPT" ]; then
+        gsettings set org.cinnamon.desktop.background picture-options "${OPT}"
+    fi
+fi
+
+# --- Desktop icons (symlink swap) --------------------------------------------
+if [ -n "$FOL" ] && [ -d "$FOL" ]; then
+    if [ -L "$DESK" ]; then
+        ln -sfn "$FOL" "$DESK"
+    elif [ -d "$DESK" ]; then
+        # Real, EMPTY directory: replace it with the symlink
+        if [ -z "$(ls -A "$DESK" 2>/dev/null)" ]; then
+            rmdir "$DESK" && ln -sfn "$FOL" "$DESK"
+        else
+            echo "ws-apply: $DESK is a real non-empty directory;" \
+                 "run 'ws-forge init' first to bootstrap" >&2
+            exit 1
+        fi
+    else
+        ln -sfn "$FOL" "$DESK"
+    fi
+
+    # Nudge Nemo to redraw the desktop, then restore the user's layout value
+    CUR=$(gsettings get org.nemo.desktop desktop-layout)
+    gsettings set org.nemo.desktop desktop-layout 'false::false'
+    sleep 0.3
+    gsettings set org.nemo.desktop desktop-layout "$CUR"
+fi
+
+echo "$N" > "$STATE"
+
+# --- Optional name popup ------------------------------------------------------
+if [ -n "$NAME" ] && command -v notify-send >/dev/null 2>&1; then
+    notify-send -t 1200 "Workspace ${N}" "${NAME}"
+fi
+
+exit 0

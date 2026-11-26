@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# ws-watchd — daemon that applies workspace configs on ANY switch.
+# Uses xprop -spy on _NET_CURRENT_DESKTOP so keyboard shortcuts, Expo,
+# panel applets and wmctrl all trigger it. X11 only (you run Muffin X11).
+set -u
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+APPLY="$SELF_DIR/ws-apply"
+CONF_DIR="${WS_FORGE_CONF_DIR:-$HOME/.config/workspace-forge}"
+PIDFILE="$CONF_DIR/watchd.pid"
+
+if ! command -v xprop >/dev/null 2>&1; then
+    echo "ws-watchd: xprop not found. Install with: sudo apt install x11-utils" >&2
+    exit 1
+fi
+
+# Single-instance guard
+if [ -f "$PIDFILE" ]; then
+    OLDPID=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        echo "ws-watchd: already running (pid $OLDPID)" >&2
+        exit 0
+    fi
+fi
+mkdir -p "$CONF_DIR"
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+echo "[ws-watchd] watching workspace switches (pid $$)..."
+
+xprop -root -spy _NET_CURRENT_DESKTOP | while read -r LINE; do
+    WS=$(printf '%s' "$LINE" | awk -F'= ' '{print $2}' | tr -d '[:space:]')
+    [ -z "$WS" ] && continue
+    # _NET_CURRENT_DESKTOP is 0-based; our config is 1-based
+    "$APPLY" "$((WS + 1))"
+done
